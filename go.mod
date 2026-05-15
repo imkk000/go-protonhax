@@ -1,4 +1,4 @@
-module protonhax
+module github.com/imkk000/go-protonhax
 
 go 1.26
 
