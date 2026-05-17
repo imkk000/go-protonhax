@@ -89,16 +89,17 @@ func main() {
 		EnableShellCompletion: true,
 		Commands: []*cli.Command{
 			{
-				Name:      "init",
-				Usage:     "Initialize a game context (called by Steam with %COMMAND%)",
-				ArgsUsage: "<cmd>",
+				Name:            "init",
+				Usage:           "Initialize a game context (called by Steam with %COMMAND%)",
+				ArgsUsage:       "<cmd>",
+				SkipFlagParsing: true,
 				Action: func(_ context.Context, cmd *cli.Command) error {
 					appid := os.Getenv("SteamAppId")
 					if appid == "" {
 						return errors.New("SteamAppId not set")
 					}
 					dir := appDir(phd, appid)
-					if err := os.MkdirAll(dir, 0750); err != nil { //nolint:gosec // 0750: owner+group only
+					if err := os.MkdirAll(dir, 0o750); err != nil { //nolint:gosec // 0750: owner+group only
 						return err
 					}
 					args := cmd.Args().Slice()
@@ -109,14 +110,14 @@ func main() {
 							break
 						}
 					}
-					if err := os.WriteFile(filepath.Join(dir, "exe"), []byte(protonExe), 0600); err != nil {
+					if err := os.WriteFile(filepath.Join(dir, "exe"), []byte(protonExe), 0o600); err != nil {
 						return err
 					}
 					pfx := os.Getenv("STEAM_COMPAT_DATA_PATH") + "/pfx"
-					if err := os.WriteFile(filepath.Join(dir, "pfx"), []byte(pfx), 0600); err != nil { //nolint:gosec // dir is derived from SteamAppId, not arbitrary user input
+					if err := os.WriteFile(filepath.Join(dir, "pfx"), []byte(pfx), 0o600); err != nil { //nolint:gosec // dir is derived from SteamAppId, not arbitrary user input
 						return err
 					}
-					if err := os.WriteFile(filepath.Join(dir, "env"), []byte(strings.Join(os.Environ(), "\n")), 0600); err != nil {
+					if err := os.WriteFile(filepath.Join(dir, "env"), []byte(strings.Join(os.Environ(), "\n")), 0o600); err != nil {
 						return err
 					}
 					if len(args) == 0 {
