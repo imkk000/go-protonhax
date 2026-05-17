@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/urfave/cli/v3"
 )
@@ -45,27 +46,84 @@ func loadEnv(envFile string) ([]string, error) {
 		}
 		env = append(env, line)
 	}
-	return env, nil
+	return stripLD32(env), nil
+}
+
+// stripLD32 removes 32-bit Steam overlay entries from LD_PRELOAD to suppress
+// "wrong ELF class: ELFCLASS32" noise when running 64-bit processes.
+func stripLD32(env []string) []string {
+	for i, line := range env {
+		if !strings.HasPrefix(line, "LD_PRELOAD=") {
+			continue
+		}
+		val := strings.TrimPrefix(line, "LD_PRELOAD=")
+		var kept []string
+		for _, p := range strings.Split(val, ":") {
+			if !strings.Contains(p, "ubuntu12_32") {
+				kept = append(kept, p)
+			}
+		}
+		if len(kept) == 0 {
+			return append(env[:i], env[i+1:]...)
+		}
+		env[i] = "LD_PRELOAD=" + strings.Join(kept, ":")
+		return env
+	}
+	return env
+}
+
+// withDebugEnv injects Proton/Wine debug vars that aren't already set.
+func withDebugEnv(env []string) []string {
+	for _, kv := range []string{"PROTON_LOG=1", "WINEDEBUG=+err,+warn"} {
+		key := kv[:strings.IndexByte(kv, '=')]
+		found := false
+		for _, e := range env {
+			if strings.HasPrefix(e, key+"=") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			env = append(env, kv)
+		}
+	}
+	return env
 }
 
 func requireApp(phd, appid string) (string, bool) {
 	dir := appDir(phd, appid)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
+	if _, err := os.Stat(dir); err != nil {
 		fmt.Fprintf(os.Stderr, "No app running with appid %q\n", appid)
 		return "", false
 	}
 	return dir, true
 }
 
-func execWithEnv(argv []string, env []string) error {
-	c := exec.Command(argv[0], argv[1:]...) //nolint:gosec // intentional: tool purpose is to exec arbitrary commands
+// execReplace replaces the current process via execve. Use for native Linux commands (exec subcommand).
+func execReplace(argv []string, env []string) error {
+	path, err := exec.LookPath(argv[0]) //nolint:gosec // intentional: tool purpose is to exec arbitrary commands
+	if err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+	if err := syscall.Exec(path, argv, env); err != nil { //nolint:gosec
+		return fmt.Errorf("exec: %w", err)
+	}
+	return nil // unreachable
+}
+
+// spawnWithEnv starts a command and returns immediately without waiting.
+// Used for Proton-based subcommands (run/cmd) where Proton blocks on wineserver
+// until the game itself exits — waiting here would require Ctrl+C.
+func spawnWithEnv(argv []string, env []string) error {
+	c := exec.Command(argv[0], argv[1:]...) //nolint:gosec
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	c.Env = env
-	if err := c.Run(); err != nil {
-		return fmt.Errorf("exec: %w", err)
+	if err := c.Start(); err != nil {
+		return fmt.Errorf("spawn: %w", err)
 	}
+	go c.Wait() //nolint:errcheck // reap child in background; return is intentionally ignored
 	return nil
 }
 
@@ -87,11 +145,20 @@ func completeAppIDs(_ context.Context, cmd *cli.Command) {
 
 func main() {
 	phd := runtimeDir()
+	var debug bool
 
 	app := &cli.Command{
 		Name:                  "protonhax",
 		Usage:                 "Run commands in Proton game contexts",
 		EnableShellCompletion: true,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:        "debug",
+				Aliases:     []string{"d"},
+				Usage:       "inject Proton/Wine debug env vars (PROTON_LOG=1, WINEDEBUG=+err,+warn)",
+				Destination: &debug,
+			},
+		},
 		Commands: []*cli.Command{
 			{
 				Name:            "init",
@@ -103,14 +170,13 @@ func main() {
 					if appid == "" {
 						return errors.New("SteamAppId not set")
 					}
-					dir := appDir(phd, appid)
-					if err := os.MkdirAll(dir, 0o750); err != nil { //nolint:gosec // 0750: owner+group only
-						return err
-					}
 					args := cmd.Args().Slice()
 					// Strip leading "--" that Steam inserts between its own args and %COMMAND%
 					for len(args) > 0 && args[0] == "--" {
 						args = args[1:]
+					}
+					if len(args) == 0 {
+						return errors.New("no command given")
 					}
 					var protonExe string
 					for _, a := range args {
@@ -119,6 +185,14 @@ func main() {
 							break
 						}
 					}
+					if protonExe == "" {
+						return errors.New("proton executable not found in args")
+					}
+					dir := appDir(phd, appid)
+					if err := os.MkdirAll(dir, 0o750); err != nil { //nolint:gosec // 0750: owner+group only
+						return err
+					}
+					defer os.RemoveAll(dir) //nolint:errcheck // best-effort cleanup on all exit paths
 					if err := os.WriteFile(filepath.Join(dir, "exe"), []byte(protonExe), 0o600); err != nil {
 						return err
 					}
@@ -129,17 +203,12 @@ func main() {
 					if err := os.WriteFile(filepath.Join(dir, "env"), []byte(strings.Join(os.Environ(), "\n")), 0o600); err != nil {
 						return err
 					}
-					if len(args) == 0 {
-						return errors.New("no command given")
-					}
 					c := exec.Command(args[0], args[1:]...) //nolint:gosec // intentional: tool purpose is to exec arbitrary commands
 					c.Stdin = os.Stdin
 					c.Stdout = os.Stdout
 					c.Stderr = os.Stderr
 					c.Env = os.Environ()
-					err := c.Run()
-					os.RemoveAll(dir) //nolint:errcheck // best-effort cleanup
-					return err
+					return c.Run()
 				},
 			},
 			{
@@ -198,11 +267,14 @@ func main() {
 					if err != nil {
 						return fmt.Errorf("load env: %w", err)
 					}
+					if debug {
+						env = withDebugEnv(env)
+					}
 					protonExe, err := readFile(filepath.Join(dir, "exe"))
 					if err != nil {
 						return fmt.Errorf("read exe: %w", err)
 					}
-					return execWithEnv(append([]string{protonExe, "run"}, args[1:]...), env)
+					return spawnWithEnv(append([]string{protonExe, "run"}, args[1:]...), env)
 				},
 			},
 			{
@@ -223,6 +295,9 @@ func main() {
 					if err != nil {
 						return fmt.Errorf("load env: %w", err)
 					}
+					if debug {
+						env = withDebugEnv(env)
+					}
 					protonExe, err := readFile(filepath.Join(dir, "exe"))
 					if err != nil {
 						return fmt.Errorf("read exe: %w", err)
@@ -231,7 +306,7 @@ func main() {
 					if err != nil {
 						return fmt.Errorf("read pfx: %w", err)
 					}
-					return execWithEnv([]string{protonExe, "run", pfx + "/drive_c/windows/system32/cmd.exe"}, env)
+					return spawnWithEnv([]string{protonExe, "run", pfx + "/drive_c/windows/system32/cmd.exe"}, env)
 				},
 			},
 			{
@@ -252,7 +327,10 @@ func main() {
 					if err != nil {
 						return fmt.Errorf("load env: %w", err)
 					}
-					return execWithEnv(args[1:], env)
+					if debug {
+						env = withDebugEnv(env)
+					}
+					return execReplace(args[1:], env)
 				},
 			},
 		},
