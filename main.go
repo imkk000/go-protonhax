@@ -63,7 +63,7 @@ func execWithEnv(argv []string, env []string) error {
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	c.Env = env
-	if err := c.Start(); err != nil {
+	if err := c.Run(); err != nil {
 		return fmt.Errorf("exec: %w", err)
 	}
 	return nil
@@ -108,6 +108,10 @@ func main() {
 						return err
 					}
 					args := cmd.Args().Slice()
+					// Strip leading "--" that Steam inserts between its own args and %COMMAND%
+					for len(args) > 0 && args[0] == "--" {
+						args = args[1:]
+					}
 					var protonExe string
 					for _, a := range args {
 						if strings.Contains(a, "/proton") {
@@ -133,9 +137,9 @@ func main() {
 					c.Stdout = os.Stdout
 					c.Stderr = os.Stderr
 					c.Env = os.Environ()
-					_ = c.Run()
+					err := c.Run()
 					os.RemoveAll(dir) //nolint:errcheck // best-effort cleanup
-					return nil
+					return err
 				},
 			},
 			{
