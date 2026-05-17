@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/urfave/cli/v3"
 )
@@ -58,7 +58,12 @@ func requireApp(phd, appid string) (string, bool) {
 }
 
 func execWithEnv(argv []string, env []string) error {
-	if err := syscall.Exec(argv[0], argv, env); err != nil { //nolint:gosec // intentional: tool purpose is to exec arbitrary commands
+	c := exec.Command(argv[0], argv[1:]...) //nolint:gosec // intentional: tool purpose is to exec arbitrary commands
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	c.Env = env
+	if err := c.Start(); err != nil {
 		return fmt.Errorf("exec: %w", err)
 	}
 	return nil
@@ -123,10 +128,13 @@ func main() {
 					if len(args) == 0 {
 						return errors.New("no command given")
 					}
-					if err := syscall.Exec(args[0], args, os.Environ()); err != nil { //nolint:gosec // intentional
-						return fmt.Errorf("exec: %w", err)
-					}
-					// unreachable after Exec; cleanup is handled by the caller process
+					c := exec.Command(args[0], args[1:]...) //nolint:gosec // intentional: tool purpose is to exec arbitrary commands
+					c.Stdin = os.Stdin
+					c.Stdout = os.Stdout
+					c.Stderr = os.Stderr
+					c.Env = os.Environ()
+					_ = c.Run()
+					os.RemoveAll(dir) //nolint:errcheck // best-effort cleanup
 					return nil
 				},
 			},
