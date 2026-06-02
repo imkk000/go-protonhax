@@ -92,6 +92,19 @@ protonhax exec 123456 env | grep STEAM
 protonhax exec 123456 wine --version
 ```
 
+---
+
+```
+protonhax build <appid> <windows-exe> [args...]
+```
+Runs a Windows executable through Proton's `wine` directly against the game's prefix — **without the game running and without Steam involvement**. Useful for invoking Windows toolchains (e.g. `go.exe`, `gcc.exe`) that are installed inside the Wine prefix, for example to cross-compile cgo binaries for Windows. The Proton version is resolved from `compatdata/<appid>/config_info`; if that cannot be parsed, the newest installed Proton under `steamapps/common/` is used. The command blocks until the child exits and its exit code is propagated.
+
+```sh
+# Cross-compile a cgo binary for Windows using a mingw64 toolchain in the prefix
+protonhax build 2694490 'C:\mingw64\bin\gcc.exe' --version
+protonhax build 2694490 cmd /c go.exe build -o out.exe .
+```
+
 ## Exit codes
 
 | Code | Meaning |

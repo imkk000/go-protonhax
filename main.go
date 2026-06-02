@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/urfave/cli/v3"
 )
@@ -124,6 +125,83 @@ func spawnWithEnv(argv []string, env []string) error {
 		return fmt.Errorf("spawn: %w", err)
 	}
 	go c.Wait() //nolint:errcheck // reap child in background; return is intentionally ignored
+	return nil
+}
+
+// steamAppsDir returns ~/.steam/steam/steamapps.
+func steamAppsDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".steam/steam/steamapps")
+}
+
+// setEnv replaces or appends a KEY=val entry in an env slice.
+func setEnv(env []string, key, val string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + val
+			return env
+		}
+	}
+	return append(env, prefix+val)
+}
+
+// resolveProtonWine returns the wine binary for the given appid.
+// It reads compatdata/<appid>/config_info looking for an embedded Proton dir name,
+// then falls back to the newest Proton install under steamapps/common/ by mod time.
+func resolveProtonWine(appid, steamApps string) (string, error) {
+	configInfo := filepath.Join(steamApps, "compatdata", appid, "config_info")
+	if data, err := os.ReadFile(configInfo); err == nil { //nolint:gosec
+		// config_info may be binary; tokenise on common separators and look for Proton paths.
+		for _, tok := range strings.FieldsFunc(string(data), func(r rune) bool {
+			return r == '\n' || r == '\r' || r == '\x00'
+		}) {
+			tok = strings.TrimSpace(tok)
+			if !strings.Contains(tok, "Proton") {
+				continue
+			}
+			for _, candidate := range []string{
+				filepath.Join(tok, "files/bin/wine"),
+				filepath.Join(steamApps, "common", tok, "files/bin/wine"),
+			} {
+				if _, err := os.Stat(candidate); err == nil {
+					return candidate, nil
+				}
+			}
+		}
+	}
+	// Fallback: scan installed Proton versions and pick the newest by dir mod time.
+	matches, _ := filepath.Glob(filepath.Join(steamApps, "common/Proton */files/bin/wine"))
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no Proton installation found under %s", filepath.Join(steamApps, "common"))
+	}
+	newest := matches[0]
+	var newestMod time.Time
+	for _, m := range matches {
+		protonDir := filepath.Dir(filepath.Dir(filepath.Dir(m)))
+		if info, err := os.Stat(protonDir); err == nil && info.ModTime().After(newestMod) {
+			newestMod = info.ModTime()
+			newest = m
+		}
+	}
+	return newest, nil
+}
+
+// runBlocking runs argv with the given env, inheriting stdin/stdout/stderr,
+// waits for the child to finish, and propagates its exit code via os.Exit.
+func runBlocking(argv []string, env []string) error {
+	c := exec.Command(argv[0], argv[1:]...) //nolint:gosec
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	c.Env = env
+	if err := c.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
+		return err
+	}
 	return nil
 }
 
@@ -331,6 +409,34 @@ func main() {
 						env = withDebugEnv(env)
 					}
 					return execReplace(args[1:], env)
+				},
+			},
+			{
+				Name:      "build",
+				Usage:     "Run a Windows executable via Proton without the game running",
+				ArgsUsage: "<appid> <cmd> [args...]",
+				Action: func(_ context.Context, cmd *cli.Command) error {
+					args := cmd.Args().Slice()
+					if len(args) < 2 {
+						return errors.New("usage: protonhax build <appid> <cmd> [args...]")
+					}
+					appid := args[0]
+					steamApps := steamAppsDir()
+
+					pfx := filepath.Join(steamApps, "compatdata", appid, "pfx")
+					if _, err := os.Stat(pfx); err != nil {
+						return fmt.Errorf("no Wine prefix for appid %q (expected %s)", appid, pfx)
+					}
+
+					wine, err := resolveProtonWine(appid, steamApps)
+					if err != nil {
+						return err
+					}
+
+					env := setEnv(os.Environ(), "WINEPREFIX", pfx)
+					env = setEnv(env, "WINEFSYNC", "1")
+
+					return runBlocking(append([]string{wine}, args[1:]...), env)
 				},
 			},
 		},
